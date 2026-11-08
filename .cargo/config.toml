@@ -1,0 +1,5 @@
+# Servo's repository contains deeply nested WPT/test262 paths.  Use the
+# system Git client for fetching Git dependencies so Windows long-path support
+# and the user's Git configuration are respected.
+[net]
+git-fetch-with-cli = true

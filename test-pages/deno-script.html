@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Servo Boa Deno Script Test</title>
+  <style>
+    body { font-family: sans-serif; line-height: 1.6; margin: 2rem; }
+    code { background: #eee; padding: .15rem .35rem; }
+    .ok { color: #087f23; }
+    .pending { color: #995c00; }
+    section { border: 1px solid #ccc; border-radius: .5rem; margin: 1rem 0; padding: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Servo + Boa Deno Script Test</h1>
+
+  <section>
+    <h2>通常のJavaScript</h2>
+    <p id="normal-script" class="pending">未実行</p>
+  </section>
+
+  <section>
+    <h2>Deno script候補</h2>
+    <p>このタグは、将来ServoからBoaへ渡して評価します。</p>
+    <p id="deno-script" class="pending">Boaによる評価待ち</p>
+  </section>
+
+  <script>
+    document.getElementById("normal-script").textContent =
+      "通常のJavaScriptはServoの既存JavaScriptエンジンで実行されました。";
+    document.getElementById("normal-script").className = "ok";
+  </script>
+
+  <script type="application/deno">
+    const text = Deno.readTextFileSync("deno-read-test.txt").trim();
+    let writeDenied = false;
+    try {
+      Deno.writeTextFileSync("deno-write-test.txt", "must fail");
+    } catch {
+      writeDenied = true;
+    }
+    "read=" + text + "; writeDenied=" + writeDenied;
+  </script>
+</body>
+</html>

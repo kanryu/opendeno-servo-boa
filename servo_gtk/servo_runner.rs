@@ -1,0 +1,621 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+use crate::key_tables::KeyLocation;
+use async_channel;
+#[cfg(not(windows))]
+use gio::prelude::*;
+#[cfg(not(windows))]
+use gio::{Subprocess, SubprocessFlags, SubprocessLauncher};
+use glib::{debug, error, info, warn};
+use prost::Message;
+#[cfg(windows)]
+use std::io::{Read, Write};
+#[cfg(not(windows))]
+use std::ffi::OsStr;
+#[cfg(windows)]
+use std::process::{Command, Stdio};
+
+use crate::proto_ipc::{ServoAction, ServoEvent, servo_action};
+
+const G_LOG_DOMAIN: &str = "ServoGtk";
+
+#[derive(Debug, Clone, Copy)]
+pub enum LogLevel {
+    Debug = 0,
+    Info = 1,
+    Warn = 2,
+    Error = 3,
+}
+
+impl From<i32> for LogLevel {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => LogLevel::Debug,
+            1 => LogLevel::Info,
+            2 => LogLevel::Warn,
+            3 => LogLevel::Error,
+            _ => LogLevel::Info,
+        }
+    }
+}
+
+pub struct ServoRunner {
+    frame_sender: async_channel::Sender<Vec<u8>>,
+    event_receiver: async_channel::Receiver<ServoEvent>,
+    #[cfg(not(windows))]
+    _subprocess: Subprocess,
+    #[cfg(windows)]
+    _child: std::process::Child,
+}
+
+#[allow(clippy::new_without_default)]
+impl ServoRunner {
+    pub fn new() -> Self {
+        #[cfg(not(windows))]
+        let launcher =
+            SubprocessLauncher::new(SubprocessFlags::STDIN_PIPE | SubprocessFlags::STDOUT_PIPE);
+
+        // Re-execute this same executable with a marker argument so it starts
+        // as the Servo runner subprocess. The consuming application is
+        // responsible for calling `servo_gtk::run_as_runner_if_requested()` at
+        // the start of `main()` to dispatch to the runner. This removes any
+        // need to install a separate binary or invoke `cargo`.
+        let current_exe = std::env::current_exe().expect("Failed to get current executable path");
+        #[cfg(not(windows))]
+        let subprocess = launcher
+            .spawn(&[
+                current_exe.as_os_str(),
+                OsStr::new(crate::runner::RUNNER_ARG),
+            ])
+            .expect("Failed to spawn servo runner process");
+
+        #[cfg(windows)]
+        let mut child = Command::new(&current_exe)
+            .arg(crate::runner::RUNNER_ARG)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn servo runner process");
+
+        #[cfg(not(windows))]
+        let stdin = subprocess.stdin_pipe().expect("Failed to get stdin");
+        #[cfg(not(windows))]
+        let stdout = subprocess.stdout_pipe().expect("Failed to get stdout");
+
+        #[cfg(windows)]
+        let mut stdin = child.stdin.take().expect("Failed to get stdin");
+        #[cfg(windows)]
+        let mut stdout = child.stdout.take().expect("Failed to get stdout");
+
+        let (event_sender, event_receiver) = async_channel::unbounded();
+
+        // Single writer task: frames are drained from this channel and written
+        // to the subprocess stdin one at a time, in order. Spawning a separate
+        // write future per action (as before) let concurrent writes interleave
+        // and corrupt the length-prefixed frame stream, which could silently
+        // drop actions such as resize.
+        let (frame_sender, frame_receiver) = async_channel::unbounded::<Vec<u8>>();
+        #[cfg(not(windows))]
+        glib::spawn_future_local(glib::clone!(
+            #[strong]
+            stdin,
+            async move {
+                while let Ok(framed) = frame_receiver.recv().await {
+                    if stdin
+                        .write_all_future(framed, glib::Priority::DEFAULT)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        ));
+
+        #[cfg(windows)]
+        std::thread::spawn(move || {
+            while let Ok(framed) = frame_receiver.recv_blocking() {
+                if stdin.write_all(&framed).and_then(|_| stdin.flush()).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Async task to receive events from process
+        #[cfg(not(windows))]
+        glib::spawn_future_local(glib::clone!(
+            #[strong]
+            stdout,
+            async move {
+                loop {
+                    // Read 4-byte length prefix
+                    let len_buf = vec![0u8; 4];
+                    match stdout
+                        .read_all_future(len_buf, glib::Priority::DEFAULT)
+                        .await
+                    {
+                        Ok((len_buf, _, _)) => {
+                            let len = u32::from_le_bytes([
+                                len_buf[0], len_buf[1], len_buf[2], len_buf[3],
+                            ]) as usize;
+
+                            // Read message data
+                            let msg_buf = vec![0u8; len];
+                            match stdout
+                                .read_all_future(msg_buf, glib::Priority::DEFAULT)
+                                .await
+                            {
+                                Ok((msg_buf, _, _)) => {
+                                    if let Ok(event) = ServoEvent::decode_from_slice(&msg_buf)
+                                        && event_sender.send(event).await.is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        ));
+
+        #[cfg(windows)]
+        std::thread::spawn(move || loop {
+            let mut len_buf = [0u8; 4];
+            if stdout.read_exact(&mut len_buf).is_err() {
+                break;
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut msg_buf = vec![0u8; len];
+            if stdout.read_exact(&mut msg_buf).is_err() {
+                break;
+            }
+            match ServoEvent::decode_from_slice(&msg_buf) {
+                Ok(event) => {
+                    if event_sender.send_blocking(event).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {}
+            }
+        });
+
+        Self {
+            frame_sender,
+            event_receiver,
+            #[cfg(not(windows))]
+            _subprocess: subprocess,
+            #[cfg(windows)]
+            _child: child,
+        }
+    }
+
+    fn send_action(&self, action: ServoAction) {
+        // Encode into a length-prefixed frame and hand it to the single writer
+        // task, which writes frames sequentially. Ordering is preserved and
+        // frames never interleave.
+        let len = action.encoded_len();
+        let mut framed = Vec::with_capacity(4 + len);
+        framed.extend_from_slice(&(len as u32).to_le_bytes());
+        action
+            .encode(&mut framed)
+            .expect("encoding into a Vec cannot fail");
+
+        #[cfg(windows)]
+        {
+            let _ = self.frame_sender.send_blocking(framed);
+        }
+
+        #[cfg(not(windows))]
+        {
+            let sender = self.frame_sender.clone();
+            glib::spawn_future_local(async move {
+                let _ = sender.send(framed).await;
+            });
+        }
+    }
+
+    pub fn event_receiver(&self) -> async_channel::Receiver<ServoEvent> {
+        self.event_receiver.clone()
+    }
+
+    pub fn load_url(&self, url: &str) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::LoadUrl(crate::proto_ipc::LoadUrl {
+                url: url.to_string(),
+            })),
+        });
+    }
+
+    pub fn load_html(&self, html: &str, base_url: Option<&str>) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::LoadHtml(crate::proto_ipc::LoadHtml {
+                html: html.to_string(),
+                base_url: base_url.unwrap_or_default().to_string(),
+            })),
+        });
+    }
+
+    pub fn reload(&self) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::Reload(true)),
+        });
+    }
+
+    pub fn go_back(&self) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::GoBack(true)),
+        });
+    }
+
+    pub fn go_forward(&self) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::GoForward(true)),
+        });
+    }
+
+    pub fn resize(&self, width: u32, height: u32) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::Resize(crate::proto_ipc::Resize {
+                width,
+                height,
+            })),
+        });
+    }
+
+    pub fn motion(&self, x: f64, y: f64) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::Motion(crate::proto_ipc::Motion {
+                x,
+                y,
+            })),
+        });
+    }
+
+    pub fn button_press(&self, button: u32, x: f64, y: f64) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::ButtonPress(
+                crate::proto_ipc::ButtonPress { button, x, y },
+            )),
+        });
+    }
+
+    pub fn button_release(&self, button: u32, x: f64, y: f64) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::ButtonRelease(
+                crate::proto_ipc::ButtonRelease { button, x, y },
+            )),
+        });
+    }
+
+    fn convert_location(location: KeyLocation) -> crate::proto_ipc::Location {
+        match location {
+            KeyLocation::Standard => crate::proto_ipc::Location::Standard,
+            KeyLocation::Left => crate::proto_ipc::Location::Left,
+            KeyLocation::Right => crate::proto_ipc::Location::Right,
+            KeyLocation::Numpad => crate::proto_ipc::Location::Numpad,
+        }
+    }
+
+    pub fn key_press(
+        &self,
+        key: String,
+        is_character: bool,
+        location: KeyLocation,
+        key_code: u32,
+        modifiers: u32,
+    ) {
+        let key_type = if is_character {
+            crate::proto_ipc::KeyType::Character
+        } else {
+            crate::proto_ipc::KeyType::Named
+        };
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::KeyPress(crate::proto_ipc::KeyPress {
+                key,
+                key_type: key_type as i32,
+                location: Self::convert_location(location) as i32,
+                key_code,
+                modifiers,
+            })),
+        });
+    }
+
+    pub fn key_release(
+        &self,
+        key: String,
+        is_character: bool,
+        location: KeyLocation,
+        key_code: u32,
+        modifiers: u32,
+    ) {
+        let key_type = if is_character {
+            crate::proto_ipc::KeyType::Character
+        } else {
+            crate::proto_ipc::KeyType::Named
+        };
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::KeyRelease(
+                crate::proto_ipc::KeyRelease {
+                    key,
+                    key_type: key_type as i32,
+                    location: Self::convert_location(location) as i32,
+                    key_code,
+                    modifiers,
+                },
+            )),
+        });
+    }
+
+    pub fn scroll(&self, dx: f64, dy: f64) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::Scroll(crate::proto_ipc::Scroll {
+                dx,
+                dy,
+            })),
+        });
+    }
+
+    pub fn touch_begin(&self, x: f64, y: f64) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::TouchBegin(
+                crate::proto_ipc::TouchBegin { x, y },
+            )),
+        });
+    }
+
+    pub fn touch_update(&self, x: f64, y: f64) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::TouchUpdate(
+                crate::proto_ipc::TouchUpdate { x, y },
+            )),
+        });
+    }
+
+    pub fn touch_end(&self, x: f64, y: f64) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::TouchEnd(crate::proto_ipc::TouchEnd {
+                x,
+                y,
+            })),
+        });
+    }
+
+    pub fn touch_cancel(&self, x: f64, y: f64) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::TouchCancel(
+                crate::proto_ipc::TouchCancel { x, y },
+            )),
+        });
+    }
+
+    pub fn shutdown(&self) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::Shutdown(true)),
+        });
+    }
+
+    pub fn add_user_script(&self, source: &str) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::AddUserScript(
+                crate::proto_ipc::AddUserScript {
+                    source: source.to_string(),
+                },
+            )),
+        });
+    }
+
+    pub fn add_user_style_sheet(&self, source: &str) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::AddUserStyleSheet(
+                crate::proto_ipc::AddUserStyleSheet {
+                    source: source.to_string(),
+                },
+            )),
+        });
+    }
+
+    pub fn remove_all_user_scripts(&self) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::RemoveAllUserScripts(true)),
+        });
+    }
+
+    pub fn remove_all_user_style_sheets(&self) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::RemoveAllUserStyleSheets(true)),
+        });
+    }
+
+    pub fn register_script_message_handler(&self, name: &str) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::RegisterScriptMessageHandler(
+                crate::proto_ipc::RegisterScriptMessageHandler {
+                    name: name.to_string(),
+                },
+            )),
+        });
+    }
+
+    pub fn unregister_script_message_handler(&self, name: &str) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::UnregisterScriptMessageHandler(
+                crate::proto_ipc::UnregisterScriptMessageHandler {
+                    name: name.to_string(),
+                },
+            )),
+        });
+    }
+
+    pub fn evaluate_javascript(&self, source: &str) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::EvaluateJavascript(
+                crate::proto_ipc::EvaluateJavascript {
+                    source: source.to_string(),
+                },
+            )),
+        });
+    }
+
+    pub fn set_zoom_level(&self, level: f64) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::SetZoomLevel(
+                crate::proto_ipc::SetZoomLevel { level },
+            )),
+        });
+    }
+
+    pub fn set_hidpi_scale_factor(&self, scale: f32) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::SetHidpiScaleFactor(
+                crate::proto_ipc::SetHidpiScaleFactor { scale },
+            )),
+        });
+    }
+
+    /// Start a request/response round trip that exercises the bidirectional
+    /// IPC channel end to end. The runner replies with a `PingRequest` event,
+    /// which the [`WebView`](crate::WebView) answers via
+    /// [`send_ping_response`](Self::send_ping_response).
+    pub fn ping(&self) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::Ping(crate::proto_ipc::Ping {})),
+        });
+    }
+
+    /// Answer a runner request identified by `request_id` with a ping payload.
+    ///
+    /// This is the return path of the bidirectional channel: the runner
+    /// correlates the response to the pending request it stashed under the same
+    /// id. Real delegate features add their own typed `send_*_response`
+    /// helpers alongside this one.
+    pub fn send_ping_response(&self, request_id: u64, ok: bool) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::Response(
+                crate::proto_ipc::ServoResponse {
+                    request_id,
+                    payload: Some(crate::proto_ipc::servo_response::Payload::Ping(
+                        crate::proto_ipc::PingResponse { ok },
+                    )),
+                },
+            )),
+        });
+    }
+
+    /// Answer a script dialog request (alert/confirm/prompt) identified by
+    /// `request_id`. `confirmed` is whether the user accepted; `value` is the
+    /// prompt text (ignored for alert/confirm).
+    pub fn send_script_dialog_response(&self, request_id: u64, confirmed: bool, value: &str) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::Response(
+                crate::proto_ipc::ServoResponse {
+                    request_id,
+                    payload: Some(crate::proto_ipc::servo_response::Payload::ScriptDialog(
+                        crate::proto_ipc::ScriptDialogResponse {
+                            confirmed,
+                            value: value.to_string(),
+                        },
+                    )),
+                },
+            )),
+        });
+    }
+
+    /// Answer a file chooser request identified by `request_id` with the
+    /// selected `paths`. An empty list means the user cancelled.
+    pub fn send_file_chooser_response(&self, request_id: u64, paths: Vec<String>) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::Response(
+                crate::proto_ipc::ServoResponse {
+                    request_id,
+                    payload: Some(crate::proto_ipc::servo_response::Payload::FileChooser(
+                        crate::proto_ipc::FileChooserResponse { paths },
+                    )),
+                },
+            )),
+        });
+    }
+
+    /// Answer an HTTP authentication request identified by `request_id`. When
+    /// `confirmed` is false the challenge is cancelled and the credentials are
+    /// ignored.
+    pub fn send_auth_response(
+        &self,
+        request_id: u64,
+        confirmed: bool,
+        username: &str,
+        password: &str,
+    ) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::Response(
+                crate::proto_ipc::ServoResponse {
+                    request_id,
+                    payload: Some(crate::proto_ipc::servo_response::Payload::Auth(
+                        crate::proto_ipc::AuthResponse {
+                            confirmed,
+                            username: username.to_string(),
+                            password: password.to_string(),
+                        },
+                    )),
+                },
+            )),
+        });
+    }
+
+    /// Answer a permission request identified by `request_id`.
+    pub fn send_permission_response(&self, request_id: u64, allow: bool) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::Response(
+                crate::proto_ipc::ServoResponse {
+                    request_id,
+                    payload: Some(crate::proto_ipc::servo_response::Payload::Permission(
+                        crate::proto_ipc::PermissionResponse { allow },
+                    )),
+                },
+            )),
+        });
+    }
+
+    /// Answer a context menu request identified by `request_id`. When
+    /// `selected` is true, `index` is the chosen entry's index; otherwise the
+    /// menu was dismissed.
+    pub fn send_context_menu_response(&self, request_id: u64, selected: bool, index: u32) {
+        self.send_action(ServoAction {
+            action: Some(servo_action::Action::Response(
+                crate::proto_ipc::ServoResponse {
+                    request_id,
+                    payload: Some(crate::proto_ipc::servo_response::Payload::ContextMenu(
+                        crate::proto_ipc::ContextMenuResponse { selected, index },
+                    )),
+                },
+            )),
+        });
+    }
+
+    pub fn handle_log_message(&self, level: LogLevel, message: &str) {
+        match level {
+            LogLevel::Debug => {
+                debug!("{}", message);
+            }
+            LogLevel::Info => {
+                info!("{}", message);
+            }
+            LogLevel::Warn => {
+                warn!("{}", message);
+            }
+            LogLevel::Error => {
+                error!("{}", message);
+            }
+        }
+    }
+}
+
+impl Drop for ServoRunner {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}

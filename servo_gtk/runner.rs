@@ -1,0 +1,1460 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+//! Servo runner subprocess entry point.
+//!
+//! The runner is not a separately installed binary. Instead, the library
+//! re-executes the consuming application's own executable with a marker
+//! argument (see [`RUNNER_ARG`]). The consumer is responsible for calling
+//! [`run_if_requested`] at the very start of its `main()` so that, when the
+//! process was spawned as a runner, control is handed off here and never
+//! returns to the normal application startup path.
+
+use std::cell::RefCell;
+use std::io::{self, Read, Write};
+use std::rc::Rc;
+
+use core::time::Duration;
+use dpi::PhysicalSize;
+use embedder_traits::{ContextMenuItem, WebViewPoint, WebViewVector};
+use euclid::{Point2D, Scale};
+use keyboard_types::{Code, Key, KeyState, Location, Modifiers, NamedKey};
+use prost::Message;
+
+use servo::LoadStatus;
+use servo::user_contents::UserStyleSheet;
+use servo::{
+    AuthenticationRequest, CreateNewWebViewRequest, PermissionRequest as ServoPermissionRequest,
+};
+use servo::{ConsoleLogLevel, UserContentManager, UserScript};
+use servo::{ContextMenu, EmbedderControl, FilePicker, SimpleDialog};
+use servo::{
+    DeviceIntRect, DeviceVector2D, InputEvent, KeyboardEvent, MouseButton, MouseButtonAction,
+    MouseButtonEvent, MouseMoveEvent, Opts, Scroll, ServoBuilder,
+};
+use servo::{RenderingContext, SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate};
+use std::str::FromStr;
+use std::sync::mpsc;
+use std::sync::mpsc::Receiver;
+use std::thread;
+use url::Url;
+
+use crate::proto_ipc::{
+    CursorChanged, FileChooserRequest, FrameReady, LoadEnd, LoadStart, LogLevel, LogMessage,
+    PingRequest, ScriptDialogKind, ScriptDialogRequest, ScriptMessage, ServoAction, ServoEvent,
+    TitleChanged, UrlChanged, servo_action, servo_event,
+};
+
+/// Prefix used by the injected script-message shim when forwarding a page
+/// message to the native side over the console-message bridge. Page messages
+/// are emitted as `console.log("<PREFIX>" + json)` where `json` is
+/// `{"name":<handler>,"body":<value>}`, and the runner detects this prefix in
+/// [`ServoWebViewDelegate::show_console_message`] to re-emit them as
+/// [`ScriptMessage`] events.
+pub(crate) const SCRIPT_MESSAGE_PREFIX: &str = "__servo_gtk_msg__";
+
+/// Marker argument used to signal that the process should run as a Servo
+/// runner subprocess rather than as the host application.
+pub const RUNNER_ARG: &str = "--servo-gtk-runner";
+
+/// If the current process was spawned as a Servo runner (i.e. its arguments
+/// contain [`RUNNER_ARG`]), run the runner loop and terminate the process,
+/// never returning. Otherwise, return immediately so normal application
+/// startup can proceed.
+///
+/// Consumers MUST call this as the very first thing in `main()`:
+///
+/// ```ignore
+/// fn main() {
+///     servo_gtk::run_as_runner_if_requested();
+///     // ... normal application startup ...
+/// }
+/// ```
+pub fn run_if_requested() {
+    // Only consider arguments before a `--` separator: by convention anything
+    // after `--` is positional/escaped and must not be interpreted as an
+    // option. The library always passes `RUNNER_ARG` as a regular argument
+    // when spawning, so it will always appear before any `--`.
+    let is_runner = std::env::args()
+        .skip(1)
+        .take_while(|arg| arg != "--")
+        .any(|arg| arg == RUNNER_ARG);
+    if is_runner {
+        run();
+        std::process::exit(0);
+    }
+}
+
+struct EventLogger {
+    sender: std::sync::mpsc::Sender<LogMessage>,
+}
+
+impl EventLogger {
+    fn new() -> (Self, std::sync::mpsc::Receiver<LogMessage>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        (Self { sender }, receiver)
+    }
+}
+
+impl log::Log for EventLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
+        let level = match record.level() {
+            log::Level::Error => LogLevel::Error,
+            log::Level::Warn => LogLevel::Warn,
+            log::Level::Info => LogLevel::Info,
+            log::Level::Debug => LogLevel::Debug,
+            log::Level::Trace => LogLevel::Debug,
+        };
+
+        let log_message = LogMessage {
+            level: level as i32,
+            message: format!("{}", record.args()),
+        };
+
+        let _ = self.sender.send(log_message);
+    }
+
+    fn flush(&self) {}
+}
+
+/// Maximum log level for the runner, overridable with `SERVO_GTK_LOG`.
+///
+/// This defaults to `Warn` as the logging is very expensive.
+fn max_log_level() -> log::LevelFilter {
+    match std::env::var("SERVO_GTK_LOG") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "off" => log::LevelFilter::Off,
+            "error" => log::LevelFilter::Error,
+            "warn" | "warning" => log::LevelFilter::Warn,
+            "info" => log::LevelFilter::Info,
+            "debug" => log::LevelFilter::Debug,
+            "trace" => log::LevelFilter::Trace,
+            _ => log::LevelFilter::Warn,
+        },
+        Err(_) => log::LevelFilter::Warn,
+    }
+}
+
+/// The write end of the IPC pipe.
+///
+/// `io::stdout()` is a `LineWriter`, which scans every buffer it is given for a
+/// newline; on a multi-megabyte frame that is a pointless pass over the whole
+/// payload, and it leaves the bytes after the last newline sitting in the
+/// buffer until some later write flushes them. A plain `File` on a dup of fd 1
+/// writes straight through instead of buffering.
+///
+/// This is intentionally made !Send, so that only one thread can actually write
+/// to stdout (unless `io::stdout()` is used, of course).
+#[derive(Clone)]
+struct EventPipe {
+    file: Rc<RefCell<Box<dyn Write>>>,
+}
+
+impl EventPipe {
+    fn from_stdout() -> Self {
+        Self {
+            file: Rc::new(RefCell::new(Box::new(io::stdout()))),
+        }
+    }
+
+    fn send(&self, event: ServoEvent) -> std::io::Result<()> {
+        let encoded = event.encode_to_vec();
+        let len = (encoded.len() as u32).to_le_bytes();
+
+        let mut file = self.file.borrow_mut();
+        file.write_all(&len)?;
+        file.write_all(&encoded)?;
+        // stdout is a pipe when the runner is launched by ServoRunner. Flush
+        // each framed event so the host can receive and display a new frame
+        // immediately instead of waiting for the stdio buffer to fill.
+        file.flush()
+    }
+}
+
+struct ServoWebViewDelegate {
+    rendering_context: Rc<dyn RenderingContext>,
+    event_pipe: EventPipe,
+    /// Script dialogs (alert/confirm/prompt) awaiting a UI response, shared
+    /// with the runner loop which completes them when the response arrives.
+    pending_dialogs: Rc<RefCell<PendingRequests<SimpleDialog>>>,
+    /// `<input type=file>` pickers awaiting a UI response.
+    pending_file_pickers: Rc<RefCell<PendingRequests<FilePicker>>>,
+    /// HTTP authentication challenges awaiting credentials from the UI.
+    pending_auth: Rc<RefCell<PendingRequests<AuthenticationRequest>>>,
+    /// Permission prompts awaiting an allow/deny decision from the UI.
+    pending_permissions: Rc<RefCell<PendingRequests<ServoPermissionRequest>>>,
+    /// Context menus awaiting a selection from the UI.
+    pending_context_menus: Rc<RefCell<PendingRequests<ContextMenu>>>,
+    /// Auxiliary WebViews created for popups (window.open / target=_blank).
+    ///
+    /// Servo destroys a newly created WebView immediately unless the embedder
+    /// keeps a handle, so we retain them here until their destination URL is
+    /// known. Because this runner drives a single rendering context, these
+    /// auxiliary views are not painted: once the URL arrives (via
+    /// [`WebViewDelegate::notify_url_changed`]) we surface it to the UI as a
+    /// `CreateWebView` event so a real top-level window can host it, then drop
+    /// the auxiliary view.
+    popups: Rc<PopupState>,
+}
+
+/// State tracking auxiliary popup WebViews and the id of the main one.
+#[derive(Default)]
+struct PopupState {
+    aux: RefCell<Vec<WebView>>,
+}
+
+/// The set of pending request maps the delegate stashes not-yet-answered Servo
+/// requests into, shared with the runner loop that completes them. Bundled so
+/// the delegate constructor takes a single argument rather than one per map.
+#[derive(Default)]
+struct PendingState {
+    dialogs: Rc<RefCell<PendingRequests<SimpleDialog>>>,
+    file_pickers: Rc<RefCell<PendingRequests<FilePicker>>>,
+    auth: Rc<RefCell<PendingRequests<AuthenticationRequest>>>,
+    permissions: Rc<RefCell<PendingRequests<ServoPermissionRequest>>>,
+    context_menus: Rc<RefCell<PendingRequests<ContextMenu>>>,
+}
+
+impl ServoWebViewDelegate {
+    fn new(
+        rendering_context: Rc<dyn RenderingContext>,
+        event_pipe: EventPipe,
+        pending: &PendingState,
+        popups: Rc<PopupState>,
+    ) -> Self {
+        Self {
+            rendering_context,
+            event_pipe,
+            pending_dialogs: pending.dialogs.clone(),
+            pending_file_pickers: pending.file_pickers.clone(),
+            pending_auth: pending.auth.clone(),
+            pending_permissions: pending.permissions.clone(),
+            pending_context_menus: pending.context_menus.clone(),
+            popups,
+        }
+    }
+}
+
+impl WebViewDelegate for ServoWebViewDelegate {
+    fn notify_new_frame_ready(&self, webview: WebView) {
+        let size = self.rendering_context.size2d().to_i32();
+        let viewport_rect = DeviceIntRect::from_origin_and_size(Point2D::origin(), size);
+        webview.paint();
+        self.rendering_context.present();
+
+        if let Some(rgba_image) = self.rendering_context.read_to_image(viewport_rect) {
+            let width = rgba_image.width();
+            let height = rgba_image.height();
+            let data = rgba_image.into_raw();
+
+            let event = ServoEvent {
+                event: Some(servo_event::Event::FrameReady(FrameReady {
+                    rgba_data: data,
+                    width,
+                    height,
+                })),
+            };
+            let _ = self.event_pipe.send(event);
+        }
+    }
+
+    fn notify_cursor_changed(&self, _webview: servo::WebView, cursor: servo::Cursor) {
+        let cursor_str = match cursor {
+            servo::Cursor::Default => "default",
+            servo::Cursor::Pointer => "pointer",
+            servo::Cursor::Text => "text",
+            servo::Cursor::Wait => "wait",
+            servo::Cursor::Help => "help",
+            servo::Cursor::Crosshair => "crosshair",
+            servo::Cursor::Move => "move",
+            servo::Cursor::EResize => "e-resize",
+            servo::Cursor::NeResize => "ne-resize",
+            servo::Cursor::NwResize => "nw-resize",
+            servo::Cursor::NResize => "n-resize",
+            servo::Cursor::SeResize => "se-resize",
+            servo::Cursor::SwResize => "sw-resize",
+            servo::Cursor::SResize => "s-resize",
+            servo::Cursor::WResize => "w-resize",
+            servo::Cursor::EwResize => "ew-resize",
+            servo::Cursor::NsResize => "ns-resize",
+            servo::Cursor::NeswResize => "nesw-resize",
+            servo::Cursor::NwseResize => "nwse-resize",
+            servo::Cursor::ColResize => "col-resize",
+            servo::Cursor::RowResize => "row-resize",
+            servo::Cursor::AllScroll => "all-scroll",
+            servo::Cursor::ZoomIn => "zoom-in",
+            servo::Cursor::ZoomOut => "zoom-out",
+            servo::Cursor::Alias => "alias",
+            servo::Cursor::Cell => "cell",
+            servo::Cursor::Copy => "copy",
+            servo::Cursor::ContextMenu => "context-menu",
+            servo::Cursor::NoDrop => "no-drop",
+            servo::Cursor::NotAllowed => "not-allowed",
+            servo::Cursor::Grab => "grab",
+            servo::Cursor::Grabbing => "grabbing",
+            servo::Cursor::VerticalText => "vertical-text",
+            servo::Cursor::Progress => "progress",
+            _ => "default",
+        };
+        let event = ServoEvent {
+            event: Some(servo_event::Event::CursorChanged(CursorChanged {
+                cursor: cursor_str.to_string(),
+            })),
+        };
+        let _ = self.event_pipe.send(event);
+    }
+
+    fn notify_url_changed(&self, _webview: WebView, url: Url) {
+        let event = ServoEvent {
+            event: Some(servo_event::Event::UrlChanged(UrlChanged {
+                url: url.to_string(),
+            })),
+        };
+        let _ = self.event_pipe.send(event);
+    }
+
+    fn notify_page_title_changed(&self, _webview: WebView, title: Option<String>) {
+        let event = ServoEvent {
+            event: Some(servo_event::Event::TitleChanged(TitleChanged {
+                title: title.unwrap_or_default(),
+            })),
+        };
+        let _ = self.event_pipe.send(event);
+    }
+
+    fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
+        // Use the current URL of the webview as the payload; it may be `None`
+        // very early in a load, in which case we send an empty string.
+        let url = webview.url().map(|u| u.to_string()).unwrap_or_default();
+        if let Some(event) = load_status_to_event(status, url) {
+            let _ = self.event_pipe.send(event);
+        }
+    }
+
+    fn show_console_message(&self, _webview: WebView, _level: ConsoleLogLevel, message: String) {
+        // Page->native message channel bridge: injected handler shims forward
+        // messages as prefixed console messages. Detect them here and re-emit
+        // as ScriptMessage events. Non-matching console output is ignored (the
+        // separate log-message plumbing handles normal logging).
+        if let Some(event) = parse_script_message(&message) {
+            let _ = self.event_pipe.send(event);
+        }
+    }
+
+    fn request_authentication(
+        &self,
+        _webview: WebView,
+        authentication_request: AuthenticationRequest,
+    ) {
+        let url = authentication_request.url().to_string();
+        let for_proxy = authentication_request.for_proxy();
+        let request_id = self
+            .pending_auth
+            .borrow_mut()
+            .insert(authentication_request);
+        let event = ServoEvent {
+            event: Some(servo_event::Event::AuthRequest(
+                crate::proto_ipc::AuthRequest {
+                    request_id,
+                    url,
+                    for_proxy,
+                },
+            )),
+        };
+        let _ = self.event_pipe.send(event);
+    }
+
+    fn request_create_new(&self, _parent_webview: WebView, request: CreateNewWebViewRequest) {
+        // Build the auxiliary WebView so Servo's window.open()/target=_blank
+        // succeeds and is not immediately torn down. This runner drives a
+        // single rendering context, so we do not paint the auxiliary view; we
+        // keep it alive only long enough to learn its destination URL
+        // (delivered via notify_url_changed), which we then surface to the UI
+        // as a CreateWebView event so a real top-level window can host a fresh
+        // WebView for it. The auxiliary view is dropped at that point.
+        let webview = request.builder(self.rendering_context.clone()).build();
+        self.popups.aux.borrow_mut().push(webview);
+    }
+
+    fn request_permission(&self, _webview: WebView, request: ServoPermissionRequest) {
+        // PermissionFeature derives Debug; use it for a human-readable label.
+        let feature_name = format!("{:?}", request.feature());
+        let request_id = self.pending_permissions.borrow_mut().insert(request);
+        let event = ServoEvent {
+            event: Some(servo_event::Event::PermissionRequest(
+                crate::proto_ipc::PermissionRequest {
+                    request_id,
+                    feature_name,
+                },
+            )),
+        };
+        let _ = self.event_pipe.send(event);
+    }
+
+    fn show_embedder_control(&self, _webview: WebView, embedder_control: EmbedderControl) {
+        match embedder_control {
+            EmbedderControl::SimpleDialog(dialog) => {
+                let (kind, message, default_value) = match &dialog {
+                    SimpleDialog::Alert(d) => (
+                        ScriptDialogKind::Alert,
+                        d.message().to_owned(),
+                        String::new(),
+                    ),
+                    SimpleDialog::Confirm(d) => (
+                        ScriptDialogKind::Confirm,
+                        d.message().to_owned(),
+                        String::new(),
+                    ),
+                    SimpleDialog::Prompt(d) => (
+                        ScriptDialogKind::Prompt,
+                        d.message().to_owned(),
+                        d.current_value().to_owned(),
+                    ),
+                };
+                // Stash the dialog and ask the UI to present it. The runner
+                // loop completes it when the ScriptDialogResponse arrives; if
+                // the UI never answers, dropping the dialog cancels it.
+                let request_id = self.pending_dialogs.borrow_mut().insert(dialog);
+                let event = ServoEvent {
+                    event: Some(servo_event::Event::ScriptDialogRequest(
+                        ScriptDialogRequest {
+                            request_id,
+                            kind: kind as i32,
+                            message,
+                            default_value,
+                        },
+                    )),
+                };
+                let _ = self.event_pipe.send(event);
+            }
+            EmbedderControl::FilePicker(file_picker) => {
+                let allow_multiple = file_picker.allow_select_multiple();
+                let filter_patterns = file_picker
+                    .filter_patterns()
+                    .iter()
+                    .map(|pattern| pattern.0.clone())
+                    .collect();
+                let request_id = self.pending_file_pickers.borrow_mut().insert(file_picker);
+                let event = ServoEvent {
+                    event: Some(servo_event::Event::FileChooserRequest(FileChooserRequest {
+                        request_id,
+                        allow_multiple,
+                        filter_patterns,
+                    })),
+                };
+                let _ = self.event_pipe.send(event);
+            }
+            EmbedderControl::ContextMenu(context_menu) => {
+                let position = context_menu.position();
+                let items = context_menu
+                    .items()
+                    .iter()
+                    .map(|item| match item {
+                        ContextMenuItem::Item { label, enabled, .. } => {
+                            crate::proto_ipc::ContextMenuEntry {
+                                label: label.clone(),
+                                enabled: *enabled,
+                                separator: false,
+                            }
+                        }
+                        ContextMenuItem::Separator => crate::proto_ipc::ContextMenuEntry {
+                            label: String::new(),
+                            enabled: false,
+                            separator: true,
+                        },
+                    })
+                    .collect();
+                let request_id = self.pending_context_menus.borrow_mut().insert(context_menu);
+                let event = ServoEvent {
+                    event: Some(servo_event::Event::ContextMenuRequest(
+                        crate::proto_ipc::ContextMenuRequest {
+                            request_id,
+                            items,
+                            x: position.min.x,
+                            y: position.min.y,
+                        },
+                    )),
+                };
+                let _ = self.event_pipe.send(event);
+            }
+            // Other embedder controls (select, color picker, IME) are not yet
+            // supported; dropping them falls back to their default response.
+            _ => {
+                log::debug!("Unhandled embedder control; using default response");
+            }
+        }
+    }
+}
+
+/// Parse a console message produced by the injected script-message shim into a
+/// [`ScriptMessage`] event, or `None` if it is not a script message.
+///
+/// The shim emits `"<SCRIPT_MESSAGE_PREFIX>" + JSON.stringify({name, body})`
+/// where `body` is itself the JSON serialization of the value the page passed
+/// to `postMessage`. We forward `name` and the raw JSON `body` string.
+fn parse_script_message(message: &str) -> Option<ServoEvent> {
+    let payload = message.strip_prefix(SCRIPT_MESSAGE_PREFIX)?;
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let name = value.get("name")?.as_str()?.to_string();
+    // `body` may be any JSON value; forward its serialized form as a string.
+    let body = match value.get("body") {
+        Some(body) => body.to_string(),
+        None => "null".to_string(),
+    };
+    Some(ServoEvent {
+        event: Some(servo_event::Event::ScriptMessage(ScriptMessage {
+            name,
+            body,
+        })),
+    })
+}
+
+/// Build the JavaScript source for the message-handler shim registered for
+/// `name`. Injected as a user script, it ensures
+/// `window.servoGtk.messageHandlers.<name>.postMessage(value)` forwards the
+/// value to the native side over the console-message bridge.
+fn script_message_handler_shim(name: &str) -> String {
+    // `name` is embedded as a JSON string literal to guard against injection
+    // and to preserve exact handler names.
+    let name_literal = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_string());
+    let prefix_literal = serde_json::to_string(SCRIPT_MESSAGE_PREFIX)
+        .unwrap_or_else(|_| "\"__servo_gtk_msg__\"".to_string());
+    format!(
+        r#"(function() {{
+  window.servoGtk = window.servoGtk || {{}};
+  window.servoGtk.messageHandlers = window.servoGtk.messageHandlers || {{}};
+  var name = {name_literal};
+  window.servoGtk.messageHandlers[name] = {{
+    postMessage: function(value) {{
+      console.log({prefix_literal} + JSON.stringify({{ name: name, body: value }}));
+    }}
+  }};
+}})();"#
+    )
+}
+
+/// Map a Servo [`LoadStatus`] to the corresponding [`ServoEvent`], if any.
+///
+/// Per the servo-gtk IPC contract we only surface the start and completion of
+/// a load: `Started` becomes a [`LoadStart`] and `Complete` becomes a
+/// [`LoadEnd`]. The intermediate `HeadParsed` state has no dedicated event and
+/// maps to `None`.
+fn load_status_to_event(status: LoadStatus, url: String) -> Option<ServoEvent> {
+    match status {
+        LoadStatus::Started => Some(ServoEvent {
+            event: Some(servo_event::Event::LoadStart(LoadStart { url })),
+        }),
+        LoadStatus::Complete => Some(ServoEvent {
+            event: Some(servo_event::Event::LoadEnd(LoadEnd { url })),
+        }),
+        LoadStatus::HeadParsed | LoadStatus::Stopped => None,
+    }
+}
+
+fn init_crypto() {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Error initializing crypto provider");
+}
+
+fn spawn_stdin_channel() -> Receiver<ServoAction> {
+    let (tx, rx) = mpsc::channel::<ServoAction>();
+    thread::spawn(move || {
+        let mut stdin = io::stdin();
+        loop {
+            let mut len_buf = [0u8; 4];
+            if stdin.read_exact(&mut len_buf).is_err() {
+                break;
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+
+            let mut msg_buf = vec![0u8; len];
+            if stdin.read_exact(&mut msg_buf).is_err() {
+                break;
+            }
+
+            if let Ok(action) = ServoAction::decode_from_slice(&msg_buf)
+            {
+                if tx.send(action).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    rx
+}
+
+fn convert_location(proto_location: crate::proto_ipc::Location) -> Location {
+    match proto_location {
+        crate::proto_ipc::Location::Standard => Location::Standard,
+        crate::proto_ipc::Location::Left => Location::Left,
+        crate::proto_ipc::Location::Right => Location::Right,
+        crate::proto_ipc::Location::Numpad => Location::Numpad,
+    }
+}
+
+fn convert_key_event(
+    key_str: String,
+    key_type: i32,
+    location: i32,
+    key_code: u32,
+    modifiers: u32,
+    state: KeyState,
+) -> KeyboardEvent {
+    let key = match crate::proto_ipc::KeyType::try_from(key_type)
+        .unwrap_or(crate::proto_ipc::KeyType::Character)
+    {
+        crate::proto_ipc::KeyType::Character => Key::Character(key_str),
+        crate::proto_ipc::KeyType::Named => {
+            Key::Named(NamedKey::from_str(&key_str).unwrap_or(NamedKey::Unidentified))
+        }
+    };
+    let location = convert_location(
+        crate::proto_ipc::Location::try_from(location)
+            .unwrap_or(crate::proto_ipc::Location::Standard),
+    );
+    let modifiers = Modifiers::from_bits_truncate(modifiers);
+    // TODO: Convert key_code to proper Code enum value
+    let _code = key_code; // Keep for future use
+    let code = Code::Unidentified;
+    KeyboardEvent::new_without_event(state, key, code, location, modifiers, false, false)
+}
+
+/// Complete a pending [`SimpleDialog`] with the UI's answer.
+///
+/// For a confirmed prompt the entered value is written back before confirming;
+/// alert and confirm ignore the value. A non-confirmed answer dismisses the
+/// dialog (which for alert is equivalent to confirming, since alert has no
+/// cancel path).
+fn complete_script_dialog(dialog: SimpleDialog, answer: crate::proto_ipc::ScriptDialogResponse) {
+    match dialog {
+        SimpleDialog::Alert(alert) => alert.confirm(),
+        SimpleDialog::Confirm(confirm) => {
+            if answer.confirmed {
+                confirm.confirm();
+            } else {
+                confirm.dismiss();
+            }
+        }
+        SimpleDialog::Prompt(mut prompt) => {
+            if answer.confirmed {
+                prompt.set_current_value(&answer.value);
+                prompt.confirm();
+            } else {
+                prompt.dismiss();
+            }
+        }
+    }
+}
+
+/// Complete a pending [`ContextMenu`] with the UI's selection.
+///
+/// When the UI selected an item, its action (looked up by index into the menu's
+/// items) is activated; otherwise the menu is dismissed. A separator or an
+/// out-of-range index dismisses the menu.
+fn complete_context_menu(menu: ContextMenu, answer: crate::proto_ipc::ContextMenuResponse) {
+    if !answer.selected {
+        menu.dismiss();
+        return;
+    }
+    let action = menu
+        .items()
+        .get(answer.index as usize)
+        .and_then(|item| match item {
+            ContextMenuItem::Item { action, .. } => Some(*action),
+            ContextMenuItem::Separator => None,
+        });
+    match action {
+        Some(action) => menu.select(action),
+        None => menu.dismiss(),
+    }
+}
+
+/// Complete a pending [`FilePicker`] with the UI's selection.
+///
+/// A non-empty path list is selected and submitted; an empty list dismisses
+/// the picker (equivalent to the user cancelling).
+fn complete_file_picker(mut picker: FilePicker, answer: crate::proto_ipc::FileChooserResponse) {
+    if answer.paths.is_empty() {
+        picker.dismiss();
+    } else {
+        let paths: Vec<std::path::PathBuf> = answer
+            .paths
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        picker.select(&paths);
+        picker.submit();
+    }
+}
+
+/// Build a `data:text/html` URL from an HTML string by percent-encoding it.
+///
+/// Loading generated HTML through a data: URL is how `load_html` maps onto
+/// Servo's URL-based `load()` without a bespoke data-loading API. Every byte
+/// except the RFC 3986 unreserved set is percent-encoded, which is always safe
+/// inside a data: URL body (it never introduces a stray `#`, `%` ambiguity, or
+/// whitespace that a parser could truncate on).
+fn html_to_data_url(html: &str) -> String {
+    const UNRESERVED: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~";
+    let mut out = String::from("data:text/html;charset=utf-8,");
+    for &byte in html.as_bytes() {
+        if UNRESERVED.contains(&byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Correlates outstanding runner->UI requests with the responses that come
+/// back over IPC.
+///
+/// Delegate features (script dialogs, file chooser, HTTP auth, permission and
+/// context-menu prompts) cannot answer Servo synchronously from the UI process:
+/// the request object Servo hands the delegate is not `Send` and owns a channel
+/// back into the engine, so it must stay in the runner. Instead the runner
+/// stashes that object here under a freshly allocated `request_id`, emits a
+/// request event carrying the id, and — when the matching [`ServoResponse`]
+/// action arrives — takes the object back out and completes it.
+///
+/// `T` is the stored request object (for example a Servo `SimpleDialog`). The
+/// id allocator is monotonic and never reuses an id for the lifetime of the
+/// runner, so a late or duplicate response cannot complete an unrelated
+/// request.
+struct PendingRequests<T> {
+    next_id: u64,
+    pending: std::collections::HashMap<u64, T>,
+}
+
+impl<T> PendingRequests<T> {
+    fn new() -> Self {
+        Self {
+            next_id: 1,
+            pending: std::collections::HashMap::new(),
+        }
+    }
+    /// Store `request` and return the id the UI must echo back to complete it.
+    fn insert(&mut self, request: T) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.pending.insert(id, request);
+        id
+    }
+
+    /// Remove and return the request previously stored under `id`, if any. A
+    /// response for an unknown or already-completed id yields `None`.
+    fn take(&mut self, id: u64) -> Option<T> {
+        self.pending.remove(&id)
+    }
+
+    /// Number of requests still awaiting a response.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+impl<T> Default for PendingRequests<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Clamp a requested page-zoom level to the range Servo accepts.
+///
+/// Servo clamps internally as well, but clamping here keeps the value the
+/// runner acts on identical to the one the widget mirrors, and rejects
+/// non-finite requests (which would otherwise propagate as NaN).
+fn clamp_zoom_level(level: f64) -> f32 {
+    const MIN_ZOOM: f64 = 0.1;
+    const MAX_ZOOM: f64 = 10.0;
+    if !level.is_finite() {
+        return 1.0;
+    }
+    level.clamp(MIN_ZOOM, MAX_ZOOM) as f32
+}
+
+/// Queue `action` for processing, merging it into the previous one when the
+/// intermediate states carry no information.
+fn push_coalesced_input(pending: &mut Vec<servo_action::Action>, action: ServoAction) {
+    let Some(action) = action.action else {
+        return;
+    };
+
+    match (pending.last_mut(), &action) {
+        (Some(servo_action::Action::Motion(last)), servo_action::Action::Motion(new)) => {
+            last.x = new.x;
+            last.y = new.y;
+            return;
+        }
+        (Some(servo_action::Action::Scroll(last)), servo_action::Action::Scroll(new)) => {
+            last.dx += new.dx;
+            last.dy += new.dy;
+            return;
+        }
+        _ => {}
+    }
+
+    pending.push(action);
+}
+
+/// Run the Servo runner event loop. This blocks until a shutdown action is
+/// received or the IPC pipes are closed.
+pub fn run() {
+    /// How long an otherwise idle iteration waits for input before
+    /// spinning the Servo event loop again.
+    const SPIN_INTERVAL: Duration = Duration::from_millis(5);
+
+    let (event_logger, log_receiver) = EventLogger::new();
+
+    log::set_logger(Box::leak(Box::new(event_logger))).expect("Failed to set logger");
+    log::set_max_level(max_log_level());
+
+    init_crypto();
+
+    log::info!("Starting servo runner");
+
+    let size = PhysicalSize::new(800, 600);
+    let rendering_context = Rc::new(
+        SoftwareRenderingContext::new(size).expect("Failed to create Software rendering context"),
+    );
+
+    // Give Servo a persistent, per-user config directory. Without this, Servo
+    // falls back to a throwaway `tempfile` directory under /tmp for its storage
+    // engines (ClientStorage, WebStorage, cache), which is non-persistent and
+    // prone to a "unable to open database file" (SqliteFailure CannotOpen)
+    // warning when that temp dir is reaped before the storage thread opens it.
+    //
+    // We mirror servoshell's behaviour: compute a stable config dir, ensure it
+    // exists, and pass it through `Opts`. `glib::user_config_dir()` wraps
+    // `g_get_user_config_dir()` (respects XDG_CONFIG_HOME, defaults to
+    // ~/.config on Linux).
+    let config_dir = glib::user_config_dir().join("servo-gtk");
+    if let Err(error) = std::fs::create_dir_all(&config_dir) {
+        log::warn!("Failed to create servo-gtk config dir {config_dir:?}: {error}");
+    }
+
+    let opts = Opts {
+        config_dir: Some(config_dir),
+        ..Default::default()
+    };
+
+    // Servo requires a resource reader before the constellation starts. Ensure
+    // ours is registered (and its GResource bundle available) first.
+    crate::resource_reader::ensure_registered();
+
+    let servo_builder = ServoBuilder::default().opts(opts);
+    let servo = servo_builder.build();
+
+    // User content manager: backs the parent-side servo_gtk::UserContentManager
+    // API (user-script/style injection and the page->native message channel).
+    let user_content_manager = Rc::new(UserContentManager::new(&servo));
+
+    let event_pipe = EventPipe::from_stdout();
+    let pending_state = PendingState::default();
+    let popups = Rc::new(PopupState::default());
+    let delegate = Rc::new(ServoWebViewDelegate::new(
+        rendering_context.clone(),
+        event_pipe.clone(),
+        &pending_state,
+        popups.clone(),
+    ));
+
+    let webview = WebViewBuilder::new(&servo, rendering_context)
+        .delegate(delegate)
+        .user_content_manager(user_content_manager.clone())
+        .build();
+
+    // Track the scripts and stylesheets we have added so that we can implement
+    // the bulk `remove_all_*` operations, which Servo's UserContentManager does
+    // not provide natively (it only supports removal by individual handle).
+    let mut user_scripts: Vec<Rc<UserScript>> = Vec::new();
+    let mut user_style_sheets: Vec<Rc<UserStyleSheet>> = Vec::new();
+
+    // Outstanding round-trip test requests (Task 5 primitive). Real delegate
+    // features store their Servo request objects in analogous maps.
+    let mut pending_pings: PendingRequests<()> = PendingRequests::new();
+
+    let receiver = spawn_stdin_channel();
+
+    'event_loop: loop {
+        // Process queued log messages
+        while let Ok(log_message) = log_receiver.try_recv() {
+            let event = ServoEvent {
+                event: Some(servo_event::Event::LogMessage(log_message)),
+            };
+            let _ = event_pipe.send(event);
+        }
+
+        // Block briefly for input, then drain everything else already queued.
+        let mut pending = Vec::new();
+        match receiver.recv_timeout(SPIN_INTERVAL) {
+            Ok(action) => push_coalesced_input(&mut pending, action),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        while let Ok(action) = receiver.try_recv() {
+            push_coalesced_input(&mut pending, action);
+        }
+
+        for action_type in pending {
+            match action_type {
+                servo_action::Action::LoadUrl(load_url) => {
+                    log::info!("Loading URL: {}", load_url.url);
+                    if let Ok(parsed_url) = Url::parse(&load_url.url) {
+                        webview.load(parsed_url);
+                    } else {
+                    }
+                }
+                servo_action::Action::LoadHtml(load_html) => {
+                    log::info!("Loading HTML ({} bytes)", load_html.html.len());
+                    let data_url = html_to_data_url(&load_html.html);
+                    if let Ok(parsed_url) = Url::parse(&data_url) {
+                        webview.load(parsed_url);
+                    } else {
+                        log::warn!("Failed to build data: URL for load_html");
+                    }
+                }
+                servo_action::Action::Reload(_) => {
+                    log::info!("Reloading page");
+                    webview.reload();
+                }
+                servo_action::Action::GoBack(_) => {
+                    log::info!("Going back");
+                    let _ = webview.go_back(1);
+                }
+                servo_action::Action::GoForward(_) => {
+                    log::info!("Going forward");
+                    let _ = webview.go_forward(1);
+                }
+                servo_action::Action::Resize(resize) => {
+                    log::debug!("Resizing to {}x{}", resize.width, resize.height);
+                    // `WebView::resize` resizes the rendering context and
+                    // updates the compositor document view itself (it calls
+                    // resize_rendering_context internally), so we must not
+                    // resize the context out of band here or the two desync.
+                    webview.resize(PhysicalSize::new(resize.width.max(1), resize.height.max(1)));
+                }
+                servo_action::Action::Motion(motion) => {
+                    log::debug!("Mouse motion: ({}, {})", motion.x, motion.y);
+                    webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
+                        WebViewPoint::Device(Point2D::new(motion.x as f32, motion.y as f32)),
+                    )));
+                }
+                servo_action::Action::ButtonPress(button_press) => {
+                    log::debug!(
+                        "Button press: button {} at ({}, {})",
+                        button_press.button,
+                        button_press.x,
+                        button_press.y
+                    );
+                    let mouse_button = match button_press.button {
+                        1 => MouseButton::Primary,
+                        2 => MouseButton::Auxiliary,
+                        3 => MouseButton::Secondary,
+                        _ => MouseButton::Primary,
+                    };
+                    webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                        MouseButtonAction::Down,
+                        mouse_button,
+                        WebViewPoint::Device(Point2D::new(
+                            button_press.x as f32,
+                            button_press.y as f32,
+                        )),
+                    )));
+                }
+                servo_action::Action::ButtonRelease(button_release) => {
+                    log::debug!(
+                        "Button release: button {} at ({}, {})",
+                        button_release.button,
+                        button_release.x,
+                        button_release.y
+                    );
+                    let mouse_button = match button_release.button {
+                        1 => MouseButton::Primary,
+                        2 => MouseButton::Auxiliary,
+                        3 => MouseButton::Secondary,
+                        _ => MouseButton::Primary,
+                    };
+                    webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                        MouseButtonAction::Up,
+                        mouse_button,
+                        WebViewPoint::Device(Point2D::new(
+                            button_release.x as f32,
+                            button_release.y as f32,
+                        )),
+                    )));
+                }
+                servo_action::Action::KeyPress(key_press) => {
+                    log::debug!("Key press: {}", key_press.key);
+                    let key_event = convert_key_event(
+                        key_press.key,
+                        key_press.key_type,
+                        key_press.location,
+                        key_press.key_code,
+                        key_press.modifiers,
+                        KeyState::Down,
+                    );
+                    webview.notify_input_event(InputEvent::Keyboard(key_event));
+                }
+                servo_action::Action::KeyRelease(key_release) => {
+                    log::debug!("Key release: {}", key_release.key);
+                    let key_event = convert_key_event(
+                        key_release.key,
+                        key_release.key_type,
+                        key_release.location,
+                        key_release.key_code,
+                        key_release.modifiers,
+                        KeyState::Up,
+                    );
+                    webview.notify_input_event(InputEvent::Keyboard(key_event));
+                }
+                servo_action::Action::TouchBegin(touch_begin) => {
+                    log::debug!("Touch begin at ({}, {})", touch_begin.x, touch_begin.y);
+                    webview.notify_input_event(InputEvent::Touch(servo::TouchEvent::new(
+                        servo::TouchEventType::Down,
+                        servo::TouchId(0),
+                        WebViewPoint::Device(Point2D::new(
+                            touch_begin.x as f32,
+                            touch_begin.y as f32,
+                        )),
+                        servo::TouchPointerType::Touch,
+                    )));
+                }
+                servo_action::Action::TouchUpdate(touch_update) => {
+                    log::debug!("Touch update at ({}, {})", touch_update.x, touch_update.y);
+                    webview.notify_input_event(InputEvent::Touch(servo::TouchEvent::new(
+                        servo::TouchEventType::Move,
+                        servo::TouchId(0),
+                        WebViewPoint::Device(Point2D::new(
+                            touch_update.x as f32,
+                            touch_update.y as f32,
+                        )),
+                        servo::TouchPointerType::Touch,
+                    )));
+                }
+                servo_action::Action::TouchEnd(touch_end) => {
+                    log::debug!("Touch end at ({}, {})", touch_end.x, touch_end.y);
+                    webview.notify_input_event(InputEvent::Touch(servo::TouchEvent::new(
+                        servo::TouchEventType::Up,
+                        servo::TouchId(0),
+                        WebViewPoint::Device(Point2D::new(touch_end.x as f32, touch_end.y as f32)),
+                        servo::TouchPointerType::Touch,
+                    )));
+                }
+                servo_action::Action::TouchCancel(touch_cancel) => {
+                    log::debug!("Touch cancel at ({}, {})", touch_cancel.x, touch_cancel.y);
+                    webview.notify_input_event(InputEvent::Touch(servo::TouchEvent::new(
+                        servo::TouchEventType::Cancel,
+                        servo::TouchId(0),
+                        WebViewPoint::Device(Point2D::new(
+                            touch_cancel.x as f32,
+                            touch_cancel.y as f32,
+                        )),
+                        servo::TouchPointerType::Touch,
+                    )));
+                }
+                servo_action::Action::Scroll(scroll) => {
+                    log::debug!("Scroll: dx={}, dy={}", scroll.dx, scroll.dy);
+                    // FIXME: 20 and 10 are random numbers that appear in
+                    // winit_minimal. We should properly understand it and
+                    // maybe add some constants
+                    webview.notify_scroll_event(
+                        Scroll::Delta(WebViewVector::Device(DeviceVector2D::new(
+                            20.0 * scroll.dx as f32,
+                            20.0 * scroll.dy as f32,
+                        ))),
+                        WebViewPoint::Device(Point2D::new(10.0, 10.0)),
+                    );
+                }
+                servo_action::Action::Shutdown(_) => {
+                    log::info!("Shutting down servo");
+                    break 'event_loop;
+                }
+                servo_action::Action::AddUserScript(add_user_script) => {
+                    log::info!(
+                        "Adding user script ({} bytes)",
+                        add_user_script.source.len()
+                    );
+                    let script = Rc::new(UserScript::new(add_user_script.source, None));
+                    user_content_manager.add_script(script.clone());
+                    user_scripts.push(script);
+                }
+                servo_action::Action::AddUserStyleSheet(add_user_style_sheet) => {
+                    log::info!(
+                        "Adding user style sheet ({} bytes)",
+                        add_user_style_sheet.source.len()
+                    );
+                    // Servo requires a URL to identify the stylesheet's origin;
+                    // a synthetic about: URL is sufficient for injected styles.
+                    if let Ok(url) = Url::parse("about:user-stylesheet") {
+                        let stylesheet =
+                            Rc::new(UserStyleSheet::new(add_user_style_sheet.source, url));
+                        user_content_manager.add_stylesheet(stylesheet.clone());
+                        user_style_sheets.push(stylesheet);
+                    }
+                }
+                servo_action::Action::RemoveAllUserScripts(_) => {
+                    log::info!("Removing all user scripts");
+                    for script in user_scripts.drain(..) {
+                        user_content_manager.remove_script(script);
+                    }
+                }
+                servo_action::Action::RemoveAllUserStyleSheets(_) => {
+                    log::info!("Removing all user style sheets");
+                    for stylesheet in user_style_sheets.drain(..) {
+                        user_content_manager.remove_stylesheet(stylesheet);
+                    }
+                }
+                servo_action::Action::RegisterScriptMessageHandler(register) => {
+                    log::info!("Registering script message handler: {}", register.name);
+                    // Inject a shim user script that defines
+                    // window.servoGtk.messageHandlers.<name>.postMessage and
+                    // forwards to native over the console-message bridge.
+                    let shim = script_message_handler_shim(&register.name);
+                    let script = Rc::new(UserScript::new(shim, None));
+                    user_content_manager.add_script(script.clone());
+                    user_scripts.push(script);
+                }
+                servo_action::Action::UnregisterScriptMessageHandler(unregister) => {
+                    log::info!("Unregistering script message handler: {}", unregister.name);
+                    // Servo cannot un-inject an already-applied user script, and
+                    // does not expose per-name script identity. The handler will
+                    // stop being injected once scripts are cleared/reloaded; for
+                    // now this is a no-op beyond logging. Documented divergence.
+                }
+                servo_action::Action::EvaluateJavascript(evaluate) => {
+                    log::debug!("Evaluating JavaScript ({} bytes)", evaluate.source.len());
+                    // Fire-and-forget: the result is not currently returned to
+                    // the native side.
+                    webview.evaluate_javascript(evaluate.source, |_result| {});
+                }
+                servo_action::Action::SetZoomLevel(set_zoom_level) => {
+                    let zoom = clamp_zoom_level(set_zoom_level.level);
+                    log::debug!("Setting page zoom to {zoom}");
+                    webview.set_page_zoom(zoom);
+                }
+                servo_action::Action::SetHidpiScaleFactor(set_hidpi) => {
+                    let scale = set_hidpi.scale;
+                    if scale.is_finite() && scale > 0.0 {
+                        log::debug!("Setting HiDPI scale factor to {scale}");
+                        webview.set_hidpi_scale_factor(Scale::new(scale));
+                    }
+                }
+                servo_action::Action::Ping(_) => {
+                    // Round-trip test of the request/response channel: stash a
+                    // placeholder, emit a request event, and expect a matching
+                    // ServoResponse action back.
+                    let request_id = pending_pings.insert(());
+                    log::debug!("Ping: emitting PingRequest id {request_id}");
+                    let event = ServoEvent {
+                        event: Some(servo_event::Event::PingRequest(PingRequest { request_id })),
+                    };
+                    let _ = event_pipe.send(event);
+                }
+                servo_action::Action::Response(response) => {
+                    let request_id = response.request_id;
+                    match response.payload {
+                        Some(crate::proto_ipc::servo_response::Payload::Ping(ping)) => {
+                            let taken = pending_pings.take(request_id);
+                            match taken {
+                                Some(()) => log::info!(
+                                    "Ping round trip complete for id {request_id} (ok={})",
+                                    ping.ok
+                                ),
+                                None => log::warn!(
+                                    "Received ping response for unknown request id {request_id}"
+                                ),
+                            }
+                        }
+                        Some(crate::proto_ipc::servo_response::Payload::ScriptDialog(answer)) => {
+                            // Take the request out (releasing the RefCell borrow)
+                            // before completing it: completing drops the Servo
+                            // request object, which sends the response and can
+                            // re-enter the delegate, so the borrow must not be
+                            // held across it.
+                            let dialog = pending_state.dialogs.borrow_mut().take(request_id);
+                            match dialog {
+                                Some(dialog) => complete_script_dialog(dialog, answer),
+                                None => log::warn!(
+                                    "Received dialog response for unknown request id {request_id}"
+                                ),
+                            }
+                        }
+                        Some(crate::proto_ipc::servo_response::Payload::FileChooser(answer)) => {
+                            let picker = pending_state.file_pickers.borrow_mut().take(request_id);
+                            match picker {
+                                Some(picker) => complete_file_picker(picker, answer),
+                                None => log::warn!(
+                                    "Received file chooser response for unknown request id {request_id}"
+                                ),
+                            }
+                        }
+                        Some(crate::proto_ipc::servo_response::Payload::Auth(answer)) => {
+                            let auth = pending_state.auth.borrow_mut().take(request_id);
+                            match auth {
+                                Some(auth) => {
+                                    if answer.confirmed {
+                                        auth.authenticate(answer.username, answer.password);
+                                    }
+                                    // Dropping without authenticate() cancels.
+                                }
+                                None => log::warn!(
+                                    "Received auth response for unknown request id {request_id}"
+                                ),
+                            }
+                        }
+                        Some(crate::proto_ipc::servo_response::Payload::Permission(answer)) => {
+                            let permission =
+                                pending_state.permissions.borrow_mut().take(request_id);
+                            match permission {
+                                Some(permission) => {
+                                    if answer.allow {
+                                        permission.allow();
+                                    } else {
+                                        permission.deny();
+                                    }
+                                }
+                                None => log::warn!(
+                                    "Received permission response for unknown request id {request_id}"
+                                ),
+                            }
+                        }
+                        Some(crate::proto_ipc::servo_response::Payload::ContextMenu(answer)) => {
+                            let menu = pending_state.context_menus.borrow_mut().take(request_id);
+                            match menu {
+                                Some(menu) => complete_context_menu(menu, answer),
+                                None => log::warn!(
+                                    "Received context menu response for unknown request id {request_id}"
+                                ),
+                            }
+                        }
+                        None => {
+                            log::warn!("Received response with no payload for id {request_id}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Spin servo event loop
+        servo.spin_event_loop();
+
+        // Surface any auxiliary popup WebViews whose destination URL is now
+        // known. We do not render them (single rendering context), so we hand
+        // the URL to the UI as a CreateWebView event and drop the auxiliary
+        // view; the UI opens a real top-level window with its own WebView.
+        {
+            let mut aux = popups.aux.borrow_mut();
+            aux.retain(|webview| match webview.url() {
+                Some(url) => {
+                    let url = url.to_string();
+                    // Ignore the transient about:blank a popup starts on.
+                    if url.is_empty() || url == "about:blank" {
+                        return true;
+                    }
+                    log::info!("Popup requested; surfacing new WebView for {url}");
+                    let event = ServoEvent {
+                        event: Some(servo_event::Event::CreateWebView(
+                            crate::proto_ipc::CreateWebView { url },
+                        )),
+                    };
+                    let _ = event_pipe.send(event);
+                    false
+                }
+                None => true,
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_status_started_maps_to_load_start() {
+        let event = load_status_to_event(LoadStatus::Started, "https://example.com/".to_string());
+        match event.and_then(|e| e.event) {
+            Some(servo_event::Event::LoadStart(load_start)) => {
+                assert_eq!(load_start.url, "https://example.com/");
+            }
+            other => panic!("expected LoadStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_status_complete_maps_to_load_end() {
+        let event = load_status_to_event(LoadStatus::Complete, "https://example.com/".to_string());
+        match event.and_then(|e| e.event) {
+            Some(servo_event::Event::LoadEnd(load_end)) => {
+                assert_eq!(load_end.url, "https://example.com/");
+            }
+            other => panic!("expected LoadEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_status_head_parsed_maps_to_none() {
+        let event =
+            load_status_to_event(LoadStatus::HeadParsed, "https://example.com/".to_string());
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn parse_script_message_ignores_unprefixed_console_output() {
+        assert!(parse_script_message("just a normal log line").is_none());
+        assert!(parse_script_message("").is_none());
+    }
+
+    #[test]
+    fn parse_script_message_extracts_name_and_body_object() {
+        let payload = format!(
+            "{SCRIPT_MESSAGE_PREFIX}{}",
+            r#"{"name":"auth","body":{"type":"TOKEN","value":"abc"}}"#
+        );
+        match parse_script_message(&payload).and_then(|e| e.event) {
+            Some(servo_event::Event::ScriptMessage(msg)) => {
+                assert_eq!(msg.name, "auth");
+                // body is forwarded as its JSON serialization
+                let parsed: serde_json::Value = serde_json::from_str(&msg.body).unwrap();
+                assert_eq!(parsed["type"], "TOKEN");
+                assert_eq!(parsed["value"], "abc");
+            }
+            other => panic!("expected ScriptMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_script_message_handles_string_body() {
+        let payload = format!(
+            "{SCRIPT_MESSAGE_PREFIX}{}",
+            r#"{"name":"h","body":"hello"}"#
+        );
+        match parse_script_message(&payload).and_then(|e| e.event) {
+            Some(servo_event::Event::ScriptMessage(msg)) => {
+                assert_eq!(msg.name, "h");
+                assert_eq!(msg.body, "\"hello\"");
+            }
+            other => panic!("expected ScriptMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_script_message_rejects_prefixed_but_invalid_json() {
+        let payload = format!("{SCRIPT_MESSAGE_PREFIX}not json");
+        assert!(parse_script_message(&payload).is_none());
+    }
+
+    #[test]
+    fn parse_script_message_requires_name() {
+        let payload = format!("{SCRIPT_MESSAGE_PREFIX}{}", r#"{"body":1}"#);
+        assert!(parse_script_message(&payload).is_none());
+    }
+
+    #[test]
+    fn shim_embeds_handler_name_and_prefix() {
+        let shim = script_message_handler_shim("myHandler");
+        assert!(shim.contains("window.servoGtk"));
+        assert!(shim.contains("messageHandlers"));
+        assert!(shim.contains("\"myHandler\""));
+        assert!(shim.contains(SCRIPT_MESSAGE_PREFIX));
+        assert!(shim.contains("postMessage"));
+    }
+
+    #[test]
+    fn shim_escapes_quotes_in_handler_name() {
+        // A handler name containing a quote must not break out of the string
+        // literal in the generated JS.
+        let shim = script_message_handler_shim("a\"b");
+        assert!(shim.contains(r#""a\"b""#));
+    }
+
+    #[test]
+    fn clamp_zoom_level_clamps_to_servo_range() {
+        assert_eq!(clamp_zoom_level(1.0), 1.0);
+        assert_eq!(clamp_zoom_level(0.05), 0.1);
+        assert_eq!(clamp_zoom_level(50.0), 10.0);
+        assert_eq!(clamp_zoom_level(0.1), 0.1);
+        assert_eq!(clamp_zoom_level(10.0), 10.0);
+    }
+
+    #[test]
+    fn clamp_zoom_level_rejects_non_finite() {
+        assert_eq!(clamp_zoom_level(f64::NAN), 1.0);
+        assert_eq!(clamp_zoom_level(f64::INFINITY), 1.0);
+        assert_eq!(clamp_zoom_level(f64::NEG_INFINITY), 1.0);
+    }
+
+    #[test]
+    fn html_to_data_url_has_prefix_and_parses() {
+        let url = html_to_data_url("<h1>Hi</h1>");
+        assert!(url.starts_with("data:text/html;charset=utf-8,"));
+        assert!(Url::parse(&url).is_ok());
+    }
+
+    #[test]
+    fn html_to_data_url_percent_encodes_reserved_and_unicode() {
+        let url = html_to_data_url("<a href=\"x\"> café #</a>");
+        // Angle brackets, quotes, spaces and '#' must be encoded so the data:
+        // URL body is not truncated or misparsed.
+        assert!(url.contains("%3C")); // <
+        assert!(url.contains("%3E")); // >
+        assert!(url.contains("%22")); // "
+        assert!(url.contains("%20")); // space
+        assert!(url.contains("%23")); // #
+        // 'é' is two UTF-8 bytes, both encoded.
+        assert!(url.contains("%C3%A9"));
+        // Unreserved characters pass through.
+        assert!(url.contains("href"));
+    }
+
+    #[test]
+    fn pending_requests_allocates_unique_monotonic_ids() {
+        let mut pending: PendingRequests<&str> = PendingRequests::new();
+        let a = pending.insert("a");
+        let b = pending.insert("b");
+        let c = pending.insert("c");
+        assert!(a < b && b < c, "ids must be strictly increasing");
+        assert_eq!(pending.len(), 3);
+    }
+
+    #[test]
+    fn pending_requests_take_returns_stored_value_once() {
+        let mut pending: PendingRequests<i32> = PendingRequests::new();
+        let id = pending.insert(42);
+        assert_eq!(pending.take(id), Some(42));
+        // A second take for the same id yields nothing (no double completion).
+        assert_eq!(pending.take(id), None);
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn pending_requests_take_unknown_id_is_none() {
+        let mut pending: PendingRequests<i32> = PendingRequests::new();
+        let id = pending.insert(1);
+        assert_eq!(pending.take(id + 999), None);
+        // The real request is untouched.
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn pending_requests_ids_not_reused_after_completion() {
+        let mut pending: PendingRequests<()> = PendingRequests::new();
+        let first = pending.insert(());
+        assert_eq!(pending.take(first), Some(()));
+        let second = pending.insert(());
+        assert_ne!(first, second, "a completed id must not be reused");
+    }
+}

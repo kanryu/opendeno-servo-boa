@@ -1,0 +1,30 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+pub mod boa_runtime;
+/// C-ABI / FFI layer, exposing the library's GObjects to C and
+/// GObject-Introspection consumers. Split into one submodule per class.
+#[path = "ffi/lib.rs"]
+pub mod ffi;
+pub mod key_tables;
+pub mod proto_ipc;
+mod resource_reader;
+pub mod runner;
+pub mod servo_runner;
+pub mod user_content;
+pub mod web_view;
+
+pub use user_content::{UserContentManager, UserScript, UserStyleSheet};
+pub use web_view::{LoadEvent, WebView};
+pub use boa_runtime::BoaRuntime;
+
+/// Hand off to the Servo runner subprocess if this process was spawned as one.
+///
+/// Consumers MUST call this as the very first statement in their `main()`.
+/// When the process was launched as the runner subprocess, this runs the
+/// runner and terminates the process without returning. Otherwise it returns
+/// immediately and normal application startup can proceed.
+pub fn run_as_runner_if_requested() {
+    runner::run_if_requested();
+}
